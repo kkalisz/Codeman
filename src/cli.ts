@@ -930,40 +930,61 @@ program
   .argument('[session]', 'attach straight to a session: its number in `codeman tui --list`, or its exact session name')
   .description('Terminal dashboard for your sessions (the web UI remains the primary surface)')
   .option('-l, --list', 'Print the numbered session list and exit, instead of opening the dashboard')
-  .action(async (position: string | undefined, options: { list?: boolean }) => {
-    // Imported here, not at the top: the dashboard pulls in the whole TUI core,
-    // and every other command would pay for it at startup.
-    const { runTui, runTuiAttach, runTuiList } = await import('./tui/tui-app.js');
+  .option('--new', 'With a session name: start it here when no live session has that name, then attach')
+  .option('-m, --mode <mode>', 'With --new: run mode id, as the Run menu names it', 'claude')
+  .option('-d, --dir <folder>', 'With --new: folder to start in (default: the current folder)')
+  .action(
+    async (position: string | undefined, options: { list?: boolean; new?: boolean; mode: string; dir?: string }) => {
+      // Imported here, not at the top: the dashboard pulls in the whole TUI core,
+      // and every other command would pay for it at startup.
+      const { runTui, runTuiAttach, runTuiList } = await import('./tui/tui-app.js');
 
-    if (options.list) {
-      process.exitCode = await runTuiList();
-      return;
-    }
-    if (position !== undefined) {
-      // Digits only is a list number, as it always was; anything else is a session name.
-      if (!/^\d+$/.test(position)) {
-        if (position.trim() === '') {
-          console.error(palette.err('An empty session name matches nothing.'));
-          process.exitCode = 1;
-          return;
-        }
-        process.exitCode = await runTuiAttach(position);
-        return;
-      }
-      const n = Number.parseInt(position, 10);
-      if (!Number.isSafeInteger(n) || n < 1) {
-        console.error(palette.err(`"${position}" is not a session number.`));
-        console.error(`Run ${palette.info('codeman tui --list')} to see them.`);
+      const startFlags = options.new || options.dir !== undefined || options.mode !== 'claude';
+      if (startFlags && (options.list || position === undefined || /^\d+$/.test(position))) {
+        console.error(palette.err('--new, --mode and --dir need a session name, e.g. codeman tui api-docs --new'));
         process.exitCode = 1;
         return;
       }
-      process.exitCode = await runTuiAttach(n);
-      return;
+      if (!options.new && (options.dir !== undefined || options.mode !== 'claude')) {
+        console.error(palette.err('--mode and --dir only apply with --new'));
+        process.exitCode = 1;
+        return;
+      }
+      if (options.list) {
+        process.exitCode = await runTuiList();
+        return;
+      }
+      if (position !== undefined) {
+        // Digits only is a list number, as it always was; anything else is a session name.
+        if (!/^\d+$/.test(position)) {
+          if (position.trim() === '') {
+            console.error(palette.err('An empty session name matches nothing.'));
+            process.exitCode = 1;
+            return;
+          }
+          process.exitCode = await runTuiAttach(
+            position,
+            options.new
+              ? { start: { mode: options.mode, ...(options.dir !== undefined ? { dir: options.dir } : {}) } }
+              : {}
+          );
+          return;
+        }
+        const n = Number.parseInt(position, 10);
+        if (!Number.isSafeInteger(n) || n < 1) {
+          console.error(palette.err(`"${position}" is not a session number.`));
+          console.error(`Run ${palette.info('codeman tui --list')} to see them.`);
+          process.exitCode = 1;
+          return;
+        }
+        process.exitCode = await runTuiAttach(n);
+        return;
+      }
+      // The dashboard owns the terminal until it quits; exiting explicitly keeps a
+      // stray handle (a socket mid-close) from stranding the user's shell.
+      process.exit(await runTui());
     }
-    // The dashboard owns the terminal until it quits; exiting explicitly keeps a
-    // stray handle (a socket mid-close) from stranding the user's shell.
-    process.exit(await runTui());
-  });
+  );
 
 // ============ Web / daemon / service Commands ============
 

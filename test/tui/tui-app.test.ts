@@ -10,6 +10,9 @@
  * `tui-e2e.test.ts`.
  */
 import { describe, it, expect } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   applyLiveMetrics,
   applyMuxNames,
@@ -32,6 +35,7 @@ import {
   previewIntervalMs,
   previewNoteFor,
   resolveAttachTarget,
+  resolveStartFolder,
   resyncDelayMs,
   sameFrame,
   samePreview,
@@ -970,5 +974,41 @@ describe('resolveAttachTarget (codeman tui <session>)', () => {
     expect(attachTargetError({ kind: 'none' }, 9)).toContain('there is no session 9');
     for (const kind of ['finished', 'none'] as const)
       expect(attachTargetError({ kind }, 'x')).toContain('codeman tui --list');
+  });
+});
+
+describe('resolveStartFolder (codeman tui <name> --new)', () => {
+  it('takes the current folder, or --dir relative to it', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeman-start-'));
+    mkdirSync(join(root, 'sub'));
+    try {
+      expect(await resolveStartFolder(undefined, root)).toEqual({ ok: true, workingDir: root });
+      expect(await resolveStartFolder('sub', root)).toEqual({ ok: true, workingDir: join(root, 'sub') });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a missing folder, a file, and an empty --dir', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeman-start-'));
+    writeFileSync(join(root, 'file'), '');
+    try {
+      expect(await resolveStartFolder('nope', root)).toMatchObject({
+        ok: false,
+        message: expect.stringContaining('not an existing folder'),
+      });
+      expect(await resolveStartFolder('file', root)).toMatchObject({ ok: false });
+      expect(await resolveStartFolder('  ', root)).toEqual({ ok: false, message: '--dir is empty' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an implicit home folder but allows --dir ~ on purpose', async () => {
+    expect(await resolveStartFolder(undefined, homedir())).toMatchObject({
+      ok: false,
+      message: expect.stringContaining('home folder'),
+    });
+    expect(await resolveStartFolder(homedir(), '/')).toEqual({ ok: true, workingDir: homedir() });
   });
 });

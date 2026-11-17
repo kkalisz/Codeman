@@ -45,9 +45,13 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { stat } from 'node:fs/promises';
 import { hostname as osHostname } from 'node:os';
+import { resolve as resolvePath } from 'node:path';
 import chalk from 'chalk';
 import { palette, table, tint, type Tone } from '../cli-style.js';
+import { isHomeDirectory } from '../cli-agent.js';
+import { getCli } from '../config/cli-registry/registry.js';
 import { CODEMAN_INSTANCE, resolveTmuxSocketName } from '../config/instance.js';
 import { getErrorMessage } from '../types/api.js';
 import { dropSeveredEscape, foldPreviewGlyphs, toDisplayLines } from './tui-ansi.js';
@@ -2746,17 +2750,97 @@ export function attachTargetError(
   }
 }
 
+/** `codeman tui <name> --new`: what to start when nothing live carries the name. */
+export interface TuiAttachStart {
+  /** A run mode id, as the Run menu names it. */
+  mode: string;
+  /** `--dir`, as typed; absent means the current directory. */
+  dir?: string;
+  /** The current directory; injected by tests. */
+  cwd?: string;
+}
+
+/**
+ * The folder `--new` starts in, with the same rules as a directory
+ * `codeman agent spawn`: it must exist, and an IMPLICIT cwd of HOME is refused,
+ * because the server installs hooks (and the agent skill) into the directory it
+ * is given. `--dir ~` is a deliberate choice and stays allowed.
+ */
+export async function resolveStartFolder(
+  dir: string | undefined,
+  cwd: string
+): Promise<{ ok: true; workingDir: string } | { ok: false; message: string }> {
+  if (dir !== undefined && dir.trim() === '') return { ok: false, message: '--dir is empty' };
+  const workingDir = resolvePath(cwd, dir ?? '.');
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(workingDir)) return { ok: false, message: 'the folder name contains control characters' };
+  try {
+    if (!(await stat(workingDir)).isDirectory()) throw new Error('not a directory');
+  } catch {
+    return { ok: false, message: `${workingDir} is not an existing folder` };
+  }
+  if (dir === undefined && (await isHomeDirectory(workingDir))) {
+    return {
+      ok: false,
+      message: 'refusing to start in your home folder: cd into a project, or pass --dir ~ to start there on purpose',
+    };
+  }
+  return { ok: true, workingDir };
+}
+
+/** How long `--new` waits for a freshly started session to show up with a pane. */
+const START_PANE_TIMEOUT_MS = 15_000;
+
+/**
+ * Start a session named `name` and wait until the list shows it with a pane, so
+ * the attach that follows goes through exactly the path an existing session
+ * takes. Returns the row, or the sentence to print.
+ */
+async function startNamedSession(client: TuiClient, name: string, start: TuiAttachStart): Promise<TuiRow | string> {
+  if (/^\d+$/.test(name)) return `"${name}" would read as a list number; give the session a name with a letter in it`;
+  const cli = getCli(start.mode);
+  if (!cli) return `unknown mode "${start.mode}" (the Run menu's mode ids, e.g. claude, shell)`;
+  const folder = await resolveStartFolder(start.dir, start.cwd ?? process.cwd());
+  if (!folder.ok) return folder.message;
+  let sessionId: string;
+  try {
+    sessionId = await client.startInFolder({
+      workingDir: folder.workingDir,
+      mode: start.mode,
+      startMode: cli.capabilities.startMode,
+      name,
+    });
+  } catch (error) {
+    return `could not start ${name}: ${getErrorMessage(error)}`;
+  }
+  const deadline = Date.now() + START_PANE_TIMEOUT_MS;
+  for (;;) {
+    const state = await snapshot(client).catch(() => null);
+    if (state?.kind === 'ok') {
+      const row = state.rows.find((candidate) => candidate.session.sessionId === sessionId);
+      if (row?.session.muxName) return row;
+    }
+    if (Date.now() > deadline)
+      return `started ${name} (${sessionId}) but its pane did not appear; try codeman tui ${name}`;
+    await new Promise((done) => setTimeout(done, 250));
+  }
+}
+
 /**
  * `codeman tui <session>`: attach straight to a row of `--list`, by its number or
  * by its session name. No screen setup at all, so it is as fast as the API call
  * it makes. The target is resolved before the terminal check, so a script learns
  * that a name does not exist (or is ambiguous) without needing a TTY.
  */
-export async function runTuiAttach(target: number | string, options: TuiRunOptions = {}): Promise<number> {
+export async function runTuiAttach(
+  target: number | string,
+  options: TuiRunOptions & { start?: TuiAttachStart } = {}
+): Promise<number> {
   const stdin = options.stdin ?? process.stdin;
   const stdout = options.stdout ?? process.stdout;
   const env = options.env ?? process.env;
   const client = options.client ?? new TuiClient();
+  const interactive = Boolean(stdout.isTTY && stdin.isTTY);
   try {
     const state = await snapshot(client).catch((error: unknown) => {
       process.stderr.write(`${palette.err(getErrorMessage(error))}\n`);
@@ -2768,12 +2852,33 @@ export async function runTuiAttach(target: number | string, options: TuiRunOptio
       return 1;
     }
     const resolved = resolveAttachTarget(state.rows, target);
-    if (resolved.kind !== 'row') {
+    let row: TuiRow;
+    if (resolved.kind === 'row') {
+      row = resolved.row;
+    } else if (resolved.kind === 'ambiguous' || !options.start || typeof target !== 'string') {
       process.stderr.write(attachTargetError(resolved, target));
       return 1;
+    } else {
+      // --new and nothing live carries the name: start it, then attach as usual.
+      // Every refusal comes BEFORE the session exists, so a refused start leaves nothing behind.
+      if (!interactive) {
+        process.stderr.write(`${palette.err('starting and attaching needs an interactive terminal.')}\n`);
+        return 1;
+      }
+      if (state.degraded) {
+        process.stderr.write(
+          `${palette.err('starting a session needs the Codeman server, which is not reachable.')}\n`
+        );
+        return 1;
+      }
+      const started = await startNamedSession(client, target, options.start);
+      if (typeof started === 'string') {
+        process.stderr.write(`${palette.err(started)}\n`);
+        return 1;
+      }
+      row = started;
     }
-    const row = resolved.row;
-    if (!stdout.isTTY || !stdin.isTTY) {
+    if (!interactive) {
       process.stderr.write(`${palette.err('attaching needs an interactive terminal.')}\n`);
       return 1;
     }

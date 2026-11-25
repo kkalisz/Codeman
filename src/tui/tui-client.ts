@@ -507,6 +507,64 @@ export function tuiSwitchAttachHook(tty: string): string {
   );
 }
 
+/**
+ * Session option naming the tty of the `codeman tui` attach that owns the
+ * window size of this session. The follow hooks below read it, so a hook whose
+ * owner is gone does nothing.
+ */
+export const TUI_FOLLOW_OWNER = '@codeman-tui-follow';
+
+/**
+ * Session hooks that keep a window following the attach's terminal, the way
+ * plain tmux follows whichever client was used last.
+ *
+ * Why they are needed: the attach sets `window-size latest`, but Codeman's web
+ * resize (`resizeWindow()` in tmux-manager.ts) runs `resize-window`, and
+ * Codeman's own attach (`setManualWindowSize()`) sets `manual`. Either puts
+ * the window back on `manual` at the browser's size. A phone opening the
+ * session mid-attach therefore pinned the window to the phone, and typing or
+ * pasting in the terminal changed nothing until a detach and a fresh attach.
+ *
+ * - `after-resize-window[91]` puts `latest` back right after Codeman's
+ *   resize, so tmux keeps deciding: the browser's client is the latest one
+ *   when Codeman resized its pty, and the terminal stays in front when the
+ *   resize did not change that pty (a forced resize at the same size, which
+ *   a browser sends when it opens a session).
+ * - `client-active[91]` puts `latest` back when the TUI's own client becomes
+ *   the latest one again, which typing, pasting or resizing the terminal does
+ *   after another client was used (measured on tmux 3.8). That covers
+ *   `setManualWindowSize()`, which sets `manual` without a resize.
+ *
+ * Indexed so they do not replace a user's own hooks, next to the switch
+ * guard's `[90]`, and set per session (`set-hook -t`), never globally.
+ *
+ * ⚠️ Constant strings: the tty is read from `TUI_FOLLOW_OWNER` when a hook
+ * runs, never interpolated. And no `-t` on `set-window-option`: tmux parses a
+ * hook's command when the hook is set, and an unquoted `#{session_name}`
+ * there starts a comment (measured: "-t expects an argument"). Without `-t`
+ * the command targets the window the hook fired for.
+ */
+export const TUI_FOLLOW_HOOKS: Readonly<Record<string, string>> = {
+  'client-active[91]': `if-shell -F "#{==:#{client_tty},#{${TUI_FOLLOW_OWNER}}}" "set-window-option window-size latest"`,
+  'after-resize-window[91]': `if-shell -F "#{!=:#{${TUI_FOLLOW_OWNER}},}" "set-window-option window-size latest"`,
+};
+
+/**
+ * For each follow hook name, what `show-hooks -t` lists at that index: `ours`,
+ * `theirs` (a hook of the user's), or absent when nothing is set there.
+ */
+export function parseFollowHooks(stdout: string): Record<string, 'ours' | 'theirs'> {
+  const found: Record<string, 'ours' | 'theirs'> = {};
+  for (const line of stdout.split('\n')) {
+    const text = line.trim();
+    for (const name of Object.keys(TUI_FOLLOW_HOOKS)) {
+      if (!text.startsWith(`${name} `)) continue;
+      found[name] = text.includes(`#{${TUI_FOLLOW_OWNER}}`) ? 'ours' : 'theirs';
+    }
+  }
+  return found;
+}
+
 const LEGACY_TUI_SWITCH = /^switch-client -t (\S+?)(?: \\; set-window-option -t \1 window-size latest)?$/;
 
 /**
@@ -1169,6 +1227,127 @@ export class TuiClient {
       await this.exec('tmux', ['-L', this.socket, 'set-option', '-gu', TUI_SWITCH_CLIENT_PID]);
     } catch {
       /* already unset */
+    }
+  }
+
+  /**
+   * Make one session's window follow this terminal for the attach: record the
+   * tty as the owner, then install `TUI_FOLLOW_HOOKS`. Best effort, like the
+   * rest of the attach dressing: false leaves the attach as it was before the
+   * hooks existed (the window follows the terminal until the web UI resizes it).
+   *
+   * A hook at either index that is not ours is the user's, and then nothing is
+   * installed. An owner already recorded is replaced: it is a TUI killed before
+   * its restore, or a second TUI on the same session, and the newest attach is
+   * the one in front of the user.
+   *
+   * ⚠️ A half-done arm is undone before answering false, because `restore()`
+   * only disarms what armed. tmux before 3.3 has no `client-active` hook, so
+   * there the owner is set and the first hook is refused; left alone, the
+   * owner would stay on the session for good.
+   */
+  async armFollowTyping(muxName: string, clientTty: string): Promise<boolean> {
+    if (!MUX_NAME_PATTERN.test(muxName) || !isTuiClientTty(clientTty)) return false;
+    try {
+      const hooks = await this.readFollowHooks(muxName);
+      if (Object.values(hooks).includes('theirs')) return false;
+    } catch {
+      return false;
+    }
+    try {
+      await this.exec('tmux', ['-L', this.socket, 'set-option', '-t', muxName, TUI_FOLLOW_OWNER, clientTty]);
+      for (const [name, command] of Object.entries(TUI_FOLLOW_HOOKS)) {
+        await this.exec('tmux', ['-L', this.socket, 'set-hook', '-t', muxName, name, command]);
+      }
+      return true;
+    } catch {
+      try {
+        await this.dropFollowTyping(muxName);
+      } catch {
+        /* the session is gone, or tmux is: nothing is left to undo then */
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Undo `armFollowTyping`, but only while this tty is still the owner: a
+   * second TUI that attached later owns the session now. The owner goes first,
+   * so the hooks are inert from that moment even if removing them fails.
+   */
+  async disarmFollowTyping(muxName: string, clientTty: string): Promise<void> {
+    if (!MUX_NAME_PATTERN.test(muxName) || !isTuiClientTty(clientTty)) return;
+    try {
+      if ((await this.readFollowOwner(muxName)) !== clientTty) return;
+      await this.dropFollowTyping(muxName);
+    } catch {
+      /* the session may be gone (the user exited the agent from inside the attach) */
+    }
+  }
+
+  /**
+   * Remove follow hooks a previous TUI never got to take down.
+   *
+   * Same leak as the banners: a terminal that dies while attached (a closed
+   * window, a dropped SSH) never reaches `restore()`, and its owner stays
+   * recorded, so the window kept following whatever client a pty reusing that
+   * number belonged to. This removes the owner and our hooks where the owner
+   * has no live tmux client.
+   *
+   * ⚠️ `ownTty` is never swept. The sweep runs fire-and-forget at startup, and
+   * an Enter pressed before it finishes arms this terminal before it is a tmux
+   * client, so the client listing cannot vouch for it yet. A second TUI
+   * mid-attach is a live client and is left alone the same way.
+   */
+  async clearLeakedFollowTyping(ownTty: string | null = readControllingTty()): Promise<number> {
+    let names: string[];
+    let live: Set<string>;
+    try {
+      const { stdout } = await this.exec('tmux', ['-L', this.socket, 'list-sessions', '-F', '#{session_name}']);
+      names = stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => MUX_NAME_PATTERN.test(line));
+      const clients = await this.exec('tmux', ['-L', this.socket, 'list-clients', '-F', '#{client_tty}']);
+      live = new Set(clients.stdout.split('\n').map((line) => line.trim()));
+    } catch {
+      return 0;
+    }
+    let cleared = 0;
+    for (const name of names) {
+      try {
+        const owner = await this.readFollowOwner(name);
+        if (owner === null || owner === ownTty || live.has(owner)) continue;
+        await this.dropFollowTyping(name);
+        cleared += 1;
+      } catch {
+        /* the session went away mid-sweep */
+      }
+    }
+    return cleared;
+  }
+
+  /** The tty recorded as `TUI_FOLLOW_OWNER` on a session, or null when none is. */
+  private async readFollowOwner(muxName: string): Promise<string | null> {
+    const { stdout } = await this.exec('tmux', ['-L', this.socket, 'show-options', '-t', muxName]);
+    // The listing, not `show-options -v`: an unset user option is an error on
+    // tmux 3.5 but empty output and exit 0 on 3.2a.
+    const owner = parseSessionOptions(stdout, [TUI_FOLLOW_OWNER])[TUI_FOLLOW_OWNER];
+    return owner ? owner : null;
+  }
+
+  private async readFollowHooks(muxName: string): Promise<Record<string, 'ours' | 'theirs'>> {
+    const { stdout } = await this.exec('tmux', ['-L', this.socket, 'show-hooks', '-t', muxName]);
+    return parseFollowHooks(stdout);
+  }
+
+  /** Owner first (the hooks are inert from then on), then whichever hooks are ours. */
+  private async dropFollowTyping(muxName: string): Promise<void> {
+    await this.exec('tmux', ['-L', this.socket, 'set-option', '-u', '-t', muxName, TUI_FOLLOW_OWNER]);
+    const hooks = await this.readFollowHooks(muxName);
+    for (const name of Object.keys(TUI_FOLLOW_HOOKS)) {
+      if (hooks[name] !== 'ours') continue;
+      await this.exec('tmux', ['-L', this.socket, 'set-hook', '-u', '-t', muxName, name]);
     }
   }
 

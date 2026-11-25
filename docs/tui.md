@@ -19,6 +19,7 @@ codeman tui              # the dashboard
 codeman tui --list       # print the numbered session list and exit
 codeman tui 2            # attach straight to session 2 of that list
 codeman tui api-docs     # attach straight to the live session named api-docs
+codeman tui api-docs --new   # ...or start it in this folder first, then attach
 ```
 
 The two fast paths are the scriptable ones.
@@ -93,6 +94,16 @@ number. Session names are not unique in Codeman, so when two live sessions share
 the name it refuses and prints their numbers instead of guessing; a name only a
 RECENT row carries says the session has finished. Both refusals are printed
 before the terminal check, so a script can tell them apart without a TTY.
+
+`--new` turns the same line into "start or attach": when no live session has the name, it starts
+one in the current folder (or `-d, --dir <folder>`) with exactly that name, then attaches. When a
+live session already has it, `--new` just attaches, so `cd ~/dev/api && codeman tui api-docs --new`
+works the first time and every time after. `-m, --mode <id>` picks the CLI (default `claude`; any
+installed run mode, as the Run menu names it). The session is a plain session in that folder, the
+same as a directory `codeman agent spawn`: no case is linked or created. Like `agent spawn`, it
+refuses an implicit home folder (pass `--dir ~` to mean it), and it refuses a digits-only name,
+which would read as a list number. It needs a terminal and a running server, and checks both
+before anything is created.
 
 ## The four groups
 

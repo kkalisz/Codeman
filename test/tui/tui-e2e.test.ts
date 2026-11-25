@@ -819,6 +819,64 @@ describe('codeman tui <session name>', () => {
   }, 30_000);
 });
 
+describe('codeman tui <name> --new', () => {
+  it('starts nothing without a terminal, so a refused start leaves no session behind', async () => {
+    const before = created.length;
+    const result = await runPiped(['tui', 'w5-new', '--new', '--dir', '/tmp']);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('starting and attaching needs an interactive terminal');
+    expect(created.length).toBe(before);
+  }, 30_000);
+
+  it('just attaches when a live session already has the name', async () => {
+    const before = created.length;
+    const result = await runPiped(['tui', 'w1-alpha', '--new']);
+    expect(result.code).toBe(1);
+    // Past resolution, on the attach path: the start path's wording never shows.
+    expect(result.stderr).toContain('attaching needs an interactive terminal');
+    expect(result.stderr).not.toContain('starting');
+    expect(created.length).toBe(before);
+  }, 30_000);
+
+  it('refuses the start flags without a session name, or with a number', async () => {
+    for (const args of [
+      ['tui', '--new'],
+      ['tui', '3', '--new'],
+      ['tui', '--list', '--new'],
+    ]) {
+      const result = await runPiped(args);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('need a session name');
+    }
+  }, 60_000);
+
+  it('refuses --mode and --dir without --new', async () => {
+    const result = await runPiped(['tui', 'w5-new', '--dir', '/tmp']);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('only apply with --new');
+  }, 30_000);
+
+  it('creates the named session in the folder with no case, then gives it a pane', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codeman-tui-new-'));
+    const before = { created: created.length, started: started.length };
+    const child = pty.spawn('npx', ['tsx', 'src/index.ts', 'tui', 'w5-new', '--new', '--dir', dir], {
+      name: 'xterm-256color',
+      cols: COLS,
+      rows: ROWS,
+      cwd: ROOT,
+      env: childEnv(),
+    });
+    try {
+      await waitFor(() => started.length > before.started, 'the start route call', 20_000);
+      expect(created.slice(before.created)).toEqual([{ workingDir: dir, mode: 'claude', name: 'w5-new' }]);
+      expect(started.slice(before.started)).toEqual([RESUMED]);
+    } finally {
+      child.kill();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
+});
+
 describe('codeman tui without a terminal', () => {
   it('refuses to open the dashboard and points at the fast paths', async () => {
     const result = await runPiped(['tui']);

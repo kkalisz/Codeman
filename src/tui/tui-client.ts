@@ -115,6 +115,17 @@ export interface TuiResumeOptions {
   sessionName?: string;
 }
 
+/** What `startInFolder()` needs: `codeman tui <name> --new`. */
+export interface TuiFolderStartOptions {
+  /** An existing local directory, already resolved to an absolute path. */
+  workingDir: string;
+  /** A run mode id, as the Run menu names it. */
+  mode: string;
+  /** Which start route the mode's CLI takes (`capabilities.startMode`). */
+  startMode: 'interactive' | 'shell';
+  name: string;
+}
+
 export interface TuiClientOptions {
   /** Skip discovery and talk to this origin. */
   baseUrl?: string;
@@ -903,6 +914,23 @@ export class TuiClient {
     // Creating a session does not start one: without this it has no pane, and
     // the row would sit there unattachable.
     await this.requestData('POST', `/api/sessions/${encodeURIComponent(sessionId)}/interactive`, {});
+    return sessionId;
+  }
+
+  /**
+   * Start a named session in a folder, the way a directory `codeman agent spawn`
+   * does: `POST /api/sessions` with an explicit `workingDir` (no case is linked or
+   * created), then the mode's start route to give it a pane. Returns the new id.
+   */
+  async startInFolder(options: TuiFolderStartOptions): Promise<string> {
+    const data = await this.requestData<{ session?: { id?: string } }>('POST', '/api/sessions', {
+      workingDir: options.workingDir,
+      mode: options.mode,
+      name: options.name,
+    });
+    const sessionId = data?.session?.id;
+    if (!sessionId) throw new TuiApiError('creating the session returned no session id', 502);
+    await this.requestData('POST', `/api/sessions/${encodeURIComponent(sessionId)}/${options.startMode}`, {});
     return sessionId;
   }
 
